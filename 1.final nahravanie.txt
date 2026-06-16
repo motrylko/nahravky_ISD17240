@@ -1,0 +1,190 @@
+#include <SPI.h>
+#include <ISD1700.h>
+
+#define ISD_SS 10
+ISD1700 chip(ISD_SS);
+
+const int btnRec = 2;
+const int btnPlay = 3;
+const int btnRedo = 4;
+const int btnTrim = 5; // Tlačidlo Trim na D5
+
+uint16_t currentAddress = 0x10;
+uint16_t history[100];
+uint16_t endAddresses[100]; 
+int recordCount = 0;
+bool isPrepared = false; 
+
+void waitForReady() {
+  uint16_t status;
+  unsigned long startWait = millis();
+  do {
+    status = chip.rd_status();
+    if (millis() - startWait > 5000) break; 
+    delay(10);
+  } while (status & 0x01); 
+}
+
+void setup() {
+  Serial.begin(9600);
+  pinMode(ISD_SS, OUTPUT);
+  digitalWrite(ISD_SS, HIGH);
+  
+  SPI.begin();
+  SPI.beginTransaction(SPISettings(1000000, LSBFIRST, SPI_MODE3));
+
+  pinMode(btnRec, INPUT_PULLUP);
+  pinMode(btnPlay, INPUT_PULLUP);
+  pinMode(btnRedo, INPUT_PULLUP);
+  pinMode(btnTrim, INPUT_PULLUP); // Nastavenie pinu D5
+
+  Serial.println(F("--- START SYSTEMU ---"));
+  delay(1000);
+  chip.pu();
+  waitForReady();
+
+  if (digitalRead(btnRec) == LOW) {
+    Serial.println(F("ZACIATOK MAZANIA CELEJ PAMATE"));
+    digitalWrite(ISD_SS, LOW);
+    delayMicroseconds(50);
+    SPI.transfer(0x43); SPI.transfer(0x00);
+    digitalWrite(ISD_SS, HIGH);
+    waitForReady();
+    chip.clr_int();
+    Serial.println(F("KONIEC MAZANIA"));
+    while(digitalRead(btnRec) == LOW);
+  }
+
+  // APC Nastavenie (0x000B - Monitor Audio On)
+  digitalWrite(ISD_SS, LOW);
+  delayMicroseconds(20);
+  SPI.transfer(0x65); 
+  SPI.transfer(0x0B); SPI.transfer(0x00);
+  digitalWrite(ISD_SS, HIGH);
+  
+  waitForReady();
+  chip.stop();
+  chip.clr_int();
+  Serial.println(F("--- SYSTEM PRIPRAVENY ---"));
+}
+
+void loop() {
+  if (digitalRead(btnRec) == LOW) {
+    delay(50); 
+    
+    if (!isPrepared) {
+      uint16_t eraseEnd = currentAddress + 0x80; 
+      Serial.print(F("ZACIATOK ADR MAZANIA: 0x")); Serial.print(currentAddress, HEX);
+      chip.set_erase(currentAddress, eraseEnd); 
+      waitForReady();
+      chip.clr_int();
+      isPrepared = true; 
+      Serial.println(F(" -> OK."));
+      while(digitalRead(btnRec) == LOW); 
+    } 
+    else {
+      if (recordCount < 100) {
+        history[recordCount] = currentAddress;
+        Serial.print(F("ZACIATOK ADRESY ZAPISU: 0x")); Serial.println(currentAddress, HEX);
+        
+        digitalWrite(ISD_SS, LOW);
+        delayMicroseconds(20);
+        SPI.transfer(0x81); 
+        SPI.transfer(0x00); 
+        SPI.transfer(currentAddress & 0xFF); 
+        SPI.transfer(currentAddress >> 8);   
+        SPI.transfer(0xFF); 
+        SPI.transfer(0x03); 
+        SPI.transfer(0x00); 
+        digitalWrite(ISD_SS, HIGH);
+        
+        delay(300); 
+        while(digitalRead(btnRec) == LOW); 
+        
+        chip.stop();
+        delay(500); 
+        waitForReady();
+        
+        uint16_t rawEnd = chip.rd_rec_ptr();
+        if (rawEnd <= currentAddress) rawEnd = currentAddress + 0x40;
+
+        uint16_t playEnd = rawEnd;
+        if (playEnd > currentAddress + 0x2A) {
+            playEnd -= 0x2A; 
+        }
+
+        endAddresses[recordCount] = playEnd;
+        Serial.print(F("KONIEC ADRESY (PRE PLAY): 0x")); Serial.println(playEnd, HEX);
+
+        currentAddress = playEnd + 1;
+        
+        isPrepared = false; 
+        recordCount++;
+        chip.clr_int();
+      }
+    }
+    delay(200);
+  }
+
+  if (digitalRead(btnTrim) == LOW) {
+    if (recordCount > 0) {
+      if (endAddresses[recordCount - 1] > history[recordCount - 1] + 1) {
+        endAddresses[recordCount - 1]--;
+        currentAddress = endAddresses[recordCount - 1] + 1;
+
+        Serial.print(F("TRIM AKTUALIZOVANY KONIEC: 0x")); 
+        Serial.println(endAddresses[recordCount - 1], HEX);
+
+        chip.set_play(history[recordCount - 1], endAddresses[recordCount - 1]);
+        waitForReady();
+        chip.clr_int();
+      }
+    }
+    delay(250);
+  }
+
+  if (digitalRead(btnPlay) == LOW) {
+    if (recordCount > 0) {
+      uint16_t s = history[recordCount-1];
+      uint16_t e = endAddresses[recordCount-1];
+      Serial.print(F("PLAY POSLEDNA: 0x")); Serial.print(s, HEX); 
+      Serial.print(F(" -> KONIEC: 0x")); Serial.println(e, HEX);
+      
+      chip.set_play(s, e);
+      waitForReady();
+      chip.clr_int();
+      Serial.println(F("KONIEC PLAY"));
+    }
+    while(digitalRead(btnPlay) == LOW);
+    delay(200);
+  }
+
+  if (digitalRead(btnRedo) == LOW) {
+    unsigned long pressStartTime = millis();
+    bool longPressTriggered = false;
+
+    while (digitalRead(btnRedo) == LOW) {
+      if (!longPressTriggered && (millis() - pressStartTime > 3000)) {
+        Serial.println(F("--- ZOZNAM VSETKYCH ADRESI ---"));
+        for (int i = 0; i < recordCount; i++) {
+          Serial.print(F("Nahravka ")); Serial.print(i + 1);
+          Serial.print(F(": Start: 0x")); Serial.print(history[i], HEX);
+          Serial.print(F(", Koniec: 0x")); Serial.println(endAddresses[i], HEX);
+        }
+        Serial.println(F("------------------------------"));
+        longPressTriggered = true;
+      }
+      delay(10);
+    }
+
+    if (!longPressTriggered) {
+      if (recordCount > 0) {
+        recordCount--;
+        currentAddress = history[recordCount];
+        isPrepared = false;
+        Serial.print(F("REDO: NAVRAT NA 0x")); Serial.println(currentAddress, HEX);
+      }
+    }
+    delay(200);
+  }
+}
