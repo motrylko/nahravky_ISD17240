@@ -14,7 +14,9 @@ const uint32_t SPI_SPEED = 10000; // max 1 MHz podla datasheet
 const uint16_t MEM_START = 0x196; // fixna obsadena cast 0x010-0x195 sa nikdy nemaže
 const uint16_t MEM_END   = 0x78F; // ISD17240 @ 8 kHz
 const uint8_t  SR1_RDY   = 0x01;
-const uint8_t  DEVID_ISD17240 = 0xE0; // CHIPID 11100 v bitoch 7:3
+const uint8_t  DEVID_ISD17240 = 0x80; // ISD17240 moduly casto vracaju CHIPID 10000 v bitoch 7:3
+const bool     USE_INT_RDY_PIN = false; // false = nahravanie funguje aj bez spolahliveho INT/RDY pinu
+const unsigned long REC_START_DELAY_MS = 120;
 
 uint16_t currentAddress = MEM_START;
 uint16_t history[100];
@@ -97,18 +99,25 @@ bool readyNow() {
   return (s.sr1 & SR1_RDY) != 0;
 }
 
-bool waitForReady(unsigned long timeoutMs = 6000) {
+bool waitForReady(unsigned long timeoutMs = 6000, bool warn = true) {
   unsigned long startWait = millis();
   while (millis() - startWait < timeoutMs) {
     if (readyNow()) return true;
     delay(2);
   }
-  Serial.println(F("WARN: ISD timeout RDY"));
+  if (warn) Serial.println(F("WARN: ISD timeout RDY"));
   return false;
 }
 
-// INT=LOW signalizuje dokoncenu operaciu (po pripojeni INT na D6)
-bool waitForOperation(unsigned long timeoutMs = 10000) {
+// INT=LOW signalizuje dokoncenu operaciu. Ked pin INT/RDY nie je spolahlivy,
+// nepouzivaj ho ako tvrdu podmienku - prikazy sa odoslu a program pokracuje.
+bool waitForOperation(unsigned long timeoutMs = 10000, bool warn = true) {
+  if (!USE_INT_RDY_PIN) {
+    delay(REC_START_DELAY_MS);
+    waitForReady(25, false);
+    return true;
+  }
+
   unsigned long startWait = millis();
   while (digitalRead(ISD_INT) == HIGH && millis() - startWait < 500) {
     delay(1);
@@ -118,10 +127,10 @@ bool waitForOperation(unsigned long timeoutMs = 10000) {
       if (readyNow()) return true;
       delay(2);
     }
-    Serial.println(F("WARN: ISD timeout INT+RDY"));
+    if (warn) Serial.println(F("WARN: ISD timeout INT+RDY"));
     return false;
   }
-  return waitForReady(timeoutMs);
+  return waitForReady(timeoutMs, warn);
 }
 
 void setupAPC_ANA_AUD() {
@@ -204,11 +213,10 @@ void startRecording() {
   Serial.println(recordingStart, HEX);
 
   setRec(recordingStart, MEM_END);
-  if (!waitForOperation()) {
-    Serial.println(F("REC: chyba start"));
-    return;
-  }
+  // Pri REC sa RDY/INT moze vratit az po STOP, preto tu necakame na koniec operacie.
+  delay(REC_START_DELAY_MS);
   isRecording = true;
+  Serial.println(F("REC BEZI"));
 }
 
 void finishRecording() {
@@ -307,7 +315,7 @@ void setup() {
   delay(10);
   powerUp();
   delay(50); // TPUD podla datasheet @ 8 kHz
-  waitForReady();
+  waitForReady(6000, USE_INT_RDY_PIN);
 
   uint8_t devId = readDeviceId();
   Serial.print(F("DEVID=0x"));
@@ -328,7 +336,7 @@ void setup() {
   }
 
   setupAPC_ANA_AUD();
-  waitForReady();
+  waitForReady(6000, USE_INT_RDY_PIN);
   stopISD();
   clrInt();
 
@@ -336,7 +344,11 @@ void setup() {
   Serial.print(MEM_START, HEX);
   Serial.print(F("-0x"));
   Serial.println(MEM_END, HEX);
-  Serial.println(F("INT pin: pripoj ISD INT -> Arduino D6"));
+  if (USE_INT_RDY_PIN) {
+    Serial.println(F("INT pin: pripoj ISD INT -> Arduino D6"));
+  } else {
+    Serial.println(F("INT/RDY pin: vypnuty v kode, ovladanie ide bez neho"));
+  }
   Serial.println(F("--- SYSTEM PRIPRAVENY ---"));
 }
 
