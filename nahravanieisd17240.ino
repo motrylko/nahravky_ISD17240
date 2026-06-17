@@ -10,7 +10,7 @@ const int btnPlay = 3;
 const int btnRedo = 4;
 const int btnTrim = 5;
 
-const uint32_t SPI_SPEED = 10000; // max 1 MHz podla datasheet
+const uint32_t SPI_SPEED = 10000; // max 1 MHz podla datasheet; nizka rychlost pre spolahlivy start
 const uint16_t MEM_START = 0x196; // fixna obsadena cast 0x010-0x195 sa nikdy nemaže
 const uint16_t MEM_END   = 0x78F; // ISD17240 @ 8 kHz
 const uint8_t  SR1_RDY   = 0x01;
@@ -295,7 +295,9 @@ void setup() {
   pinMode(ISD_INT, INPUT_PULLUP);
 
   SPI.begin();
-  SPI.beginTransaction(SPISettings(SPI_SPEED, LSBFIRST, SPI_MODE0));
+  // ISD17xx SPI prikazy su definovane v MSB-first poradi. Pri LSBFIRST sa
+  // napr. POWER_UP 0x01 odosle ako 0x80, cip sa nezapne (PU=0) a RDY nepride.
+  SPI.beginTransaction(SPISettings(SPI_SPEED, MSBFIRST, SPI_MODE0));
 
   pinMode(btnRec, INPUT_PULLUP);
   pinMode(btnPlay, INPUT_PULLUP);
