@@ -14,6 +14,9 @@ const uint32_t SPI_SPEED = 10000; // max 1 MHz podla datasheet
 const uint16_t MEM_START = 0x196; // fixna obsadena cast 0x010-0x195 sa nikdy nemaže
 const uint16_t MEM_END   = 0x78F; // ISD17240 @ 8 kHz
 const uint8_t  SR1_RDY   = 0x01;
+const uint8_t  SR1_REC   = 0x08;
+const uint8_t  SR0_CMD_ERR = 0x01;
+const uint8_t  SR0_PU    = 0x04;
 const uint8_t  DEVID_ISD17240 = 0xE0; // CHIPID 11100 v bitoch 7:3
 
 uint16_t currentAddress = MEM_START;
@@ -92,9 +95,35 @@ uint8_t readDeviceId() {
   return id;
 }
 
+bool cmdError(const Status &s) {
+  return (s.sr0_lo & SR0_CMD_ERR) != 0;
+}
+
+bool poweredUp(const Status &s) {
+  return (s.sr0_lo & SR0_PU) != 0;
+}
+
 bool readyNow() {
   Status s = readStatus();
   return (s.sr1 & SR1_RDY) != 0;
+}
+
+void dumpStatus(const __FlashStringHelper *label) {
+  Status s = readStatus();
+  Serial.print(label);
+  Serial.print(F(" SR0=0x"));
+  Serial.print(s.sr0_hi, HEX);
+  Serial.print(s.sr0_lo, HEX);
+  Serial.print(F(" SR1=0x"));
+  Serial.print(s.sr1, HEX);
+  Serial.print(F(" INT="));
+  Serial.print(digitalRead(ISD_INT) == LOW ? F("L") : F("H"));
+  Serial.print(F(" PU="));
+  Serial.print(poweredUp(s) ? F("1") : F("0"));
+  Serial.print(F(" CMD_ERR="));
+  Serial.print(cmdError(s) ? F("1") : F("0"));
+  Serial.print(F(" RDY="));
+  Serial.println((s.sr1 & SR1_RDY) ? F("1") : F("0"));
 }
 
 bool waitForReady(unsigned long timeoutMs = 6000) {
@@ -104,24 +133,65 @@ bool waitForReady(unsigned long timeoutMs = 6000) {
     delay(2);
   }
   Serial.println(F("WARN: ISD timeout RDY"));
+  dumpStatus(F("  stav"));
   return false;
 }
 
-// INT=LOW signalizuje dokoncenu operaciu (po pripojeni INT na D6)
-bool waitForOperation(unsigned long timeoutMs = 10000) {
+// Datasheet 11.7: po SET_REC/SET_PLAY/STOP sledovat INT (aktivne LOW)
+bool waitForIntLow(unsigned long timeoutMs = 5000) {
   unsigned long startWait = millis();
-  while (digitalRead(ISD_INT) == HIGH && millis() - startWait < 500) {
+  while (digitalRead(ISD_INT) == HIGH && millis() - startWait < timeoutMs) {
     delay(1);
   }
-  if (digitalRead(ISD_INT) == LOW) {
-    while (millis() - startWait < timeoutMs) {
-      if (readyNow()) return true;
-      delay(2);
+  return digitalRead(ISD_INT) == LOW;
+}
+
+// Pred odoslanim SET_* prikazu musi byt RDY=1 a PU=1
+bool ensureDeviceReady() {
+  for (uint8_t attempt = 0; attempt < 3; attempt++) {
+    Status s = readStatus();
+    if (cmdError(s)) {
+      clrInt();
+      delay(5);
+      continue;
     }
-    Serial.println(F("WARN: ISD timeout INT+RDY"));
-    return false;
+    if ((s.sr1 & SR1_RDY) && poweredUp(s)) return true;
+
+    if (!poweredUp(s)) {
+      powerUp();
+      delay(50);
+    } else {
+      stopISD();
+      waitForIntLow(2000);
+    }
+    clrInt();
+    if (waitForReady(4000)) return true;
   }
-  return waitForReady(timeoutMs);
+  Status s = readStatus();
+  return (s.sr1 & SR1_RDY) && poweredUp(s) && !cmdError(s);
+}
+
+// Po SET_REC/SET_PLAY: INT klesne po prijati prikazu, alebo SR1 ukaze REC/PLAY
+bool waitForSetCommandAccepted(unsigned long timeoutMs = 5000) {
+  unsigned long startWait = millis();
+  while (millis() - startWait < timeoutMs) {
+    if (digitalRead(ISD_INT) == LOW) return true;
+    Status s = readStatus();
+    if ((s.sr1 & (SR1_REC | 0x04)) != 0 && !cmdError(s)) return true;
+    delay(1);
+  }
+  Serial.println(F("WARN: ISD timeout INT pri SET"));
+  dumpStatus(F("  stav"));
+  return false;
+}
+
+// Po STOP/ERASE: INT klesne po dokonceni, potom RDY=1
+bool waitForOperationEnd(unsigned long timeoutMs = 20000) {
+  if (!waitForIntLow(timeoutMs)) {
+    Serial.println(F("WARN: ISD timeout INT"));
+    dumpStatus(F("  stav"));
+  }
+  return waitForReady(3000);
 }
 
 void setupAPC_ANA_AUD() {
@@ -203,17 +273,26 @@ void startRecording() {
   Serial.print(F("REC START addr=0x"));
   Serial.println(recordingStart, HEX);
 
+  if (!ensureDeviceReady()) {
+    Serial.println(F("REC: cip nie je pripraveny"));
+    dumpStatus(F("  stav"));
+    return;
+  }
+
+  clrInt();
   setRec(recordingStart, MEM_END);
-  if (!waitForOperation()) {
+  if (!waitForSetCommandAccepted()) {
     Serial.println(F("REC: chyba start"));
     return;
   }
+  clrInt();
   isRecording = true;
+  Serial.println(F("REC OK"));
 }
 
 void finishRecording() {
   stopISD();
-  waitForOperation();
+  waitForOperationEnd();
 
   uint16_t rawEnd = readCurrentRowAddress();
   if (rawEnd <= recordingStart || rawEnd > MEM_END) {
@@ -248,7 +327,7 @@ void eraseAndRedoLast() {
   Serial.println(end, HEX);
 
   setErase(start, end);
-  waitForOperation(20000);
+  waitForOperationEnd(20000);
   clrInt();
 
   recordCount--;
@@ -274,7 +353,7 @@ void trimLastRecording() {
   Serial.println(oldEnd, HEX);
 
   setErase(eraseFrom, oldEnd);
-  waitForOperation(20000);
+  waitForOperationEnd(20000);
   clrInt();
 
   endAddresses[recordCount - 1] = newEnd;
@@ -284,7 +363,7 @@ void trimLastRecording() {
   Serial.println(newEnd, HEX);
 
   setPlay(start, newEnd);
-  waitForOperation();
+  waitForSetCommandAccepted();
   clrInt();
 }
 
@@ -307,6 +386,7 @@ void setup() {
   delay(10);
   powerUp();
   delay(50); // TPUD podla datasheet @ 8 kHz
+  clrInt();  // datasheet 11.7: Clr_Int pred kontrolou RDY po PU
   waitForReady();
 
   uint8_t devId = readDeviceId();
@@ -318,8 +398,9 @@ void setup() {
 
   if (digitalRead(btnRec) == LOW) {
     Serial.println(F("MAZANIE DYNAMICKEJ PAMATE 0x196-0x78F..."));
+    ensureDeviceReady();
     eraseDynamicRegion();
-    waitForOperation(20000);
+    waitForOperationEnd(20000);
     clrInt();
     currentAddress = MEM_START;
     recordCount = 0;
@@ -327,10 +408,19 @@ void setup() {
     while (digitalRead(btnRec) == LOW) delay(5);
   }
 
+  ensureDeviceReady();
   setupAPC_ANA_AUD();
-  waitForReady();
+  clrInt();
+  waitForReady(2000);
   stopISD();
   clrInt();
+  waitForReady(2000);
+  if (!poweredUp(readStatus())) {
+    powerUp();
+    delay(50);
+    clrInt();
+    waitForReady();
+  }
 
   Serial.print(F("Pamat: 0x"));
   Serial.print(MEM_START, HEX);
@@ -363,7 +453,7 @@ void loop() {
       Serial.println(e, HEX);
 
       setPlay(s, e);
-      waitForOperation();
+      waitForSetCommandAccepted();
       clrInt();
       Serial.println(F("PLAY OK"));
     }
