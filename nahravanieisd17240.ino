@@ -62,7 +62,6 @@ void deselectISD() {
 void sendSimpleCommand(uint8_t opcode) {
   selectISD();
   xfer(opcode);
-  xfer(0x00);
   deselectISD();
 }
 
@@ -73,8 +72,9 @@ void clrInt() { sendSimpleCommand(0x04); }
 
 Status readStatus() {
   selectISD();
+  xfer(0x05);
   Status s;
-  s.sr0_lo = xfer(0x05);
+  s.sr0_lo = xfer(0x00);
   s.sr0_hi = xfer(0x00);
   s.sr1    = xfer(0x00);
   deselectISD();
@@ -89,10 +89,23 @@ uint16_t readCurrentRowAddress() {
 uint8_t readDeviceId() {
   selectISD();
   xfer(0x09);
-  xfer(0x00);
   uint8_t id = xfer(0x00);
   deselectISD();
   return id;
+}
+
+uint16_t readAddressPointer(uint8_t opcode) {
+  selectISD();
+  xfer(opcode);
+  uint8_t lo = xfer(0x00);
+  uint8_t hi = xfer(0x00) & 0x07;
+  xfer(0x00);
+  deselectISD();
+  return ((uint16_t)hi << 8) | lo;
+}
+
+uint16_t readRecPointer() {
+  return readAddressPointer(0x08);
 }
 
 bool cmdError(const Status &s) {
@@ -146,29 +159,17 @@ bool waitForIntLow(unsigned long timeoutMs = 5000) {
   return digitalRead(ISD_INT) == LOW;
 }
 
-// Pred odoslanim SET_* prikazu musi byt RDY=1 a PU=1
+// Pred odoslanim SET_* prikazu musi byt RDY=1
 bool ensureDeviceReady() {
-  for (uint8_t attempt = 0; attempt < 3; attempt++) {
-    Status s = readStatus();
-    if (cmdError(s)) {
-      clrInt();
-      delay(5);
-      continue;
-    }
-    if ((s.sr1 & SR1_RDY) && poweredUp(s)) return true;
-
-    if (!poweredUp(s)) {
-      powerUp();
-      delay(50);
-    } else {
-      stopISD();
-      waitForIntLow(2000);
-    }
-    clrInt();
-    if (waitForReady(4000)) return true;
-  }
   Status s = readStatus();
-  return (s.sr1 & SR1_RDY) && poweredUp(s) && !cmdError(s);
+  if ((s.sr1 & SR1_RDY) && !cmdError(s)) return true;
+
+  clrInt();
+  if (waitForReady(4000)) return true;
+
+  stopISD();
+  clrInt();
+  return waitForReady(4000);
 }
 
 // Po SET_REC/SET_PLAY: INT klesne po prijati prikazu, alebo SR1 ukaze REC/PLAY
@@ -195,8 +196,7 @@ bool waitForOperationEnd(unsigned long timeoutMs = 20000) {
 }
 
 void setupAPC_ANA_AUD() {
-  // 0x440: D6=1 SPI_FT vyp (zodpoveda FT pin HIGH), AUD vystup, max hlasitost
-  // D4=0: AnaIn cesta (pri D6=1 datasheet uvadza Mic REC; overte na module s AnaIn)
+  // APC=0x0440: SPI_FT, AUD vystup, max hlasitost, AnaIn cesta
   selectISD();
   xfer(0x65);
   xfer(0x40);
@@ -294,7 +294,7 @@ void finishRecording() {
   stopISD();
   waitForOperationEnd();
 
-  uint16_t rawEnd = readCurrentRowAddress();
+  uint16_t rawEnd = readRecPointer();
   if (rawEnd <= recordingStart || rawEnd > MEM_END) {
     rawEnd = recordingStart + 1;
   }
@@ -374,7 +374,7 @@ void setup() {
   pinMode(ISD_INT, INPUT_PULLUP);
 
   SPI.begin();
-  SPI.beginTransaction(SPISettings(SPI_SPEED, LSBFIRST, SPI_MODE0));
+  SPI.beginTransaction(SPISettings(SPI_SPEED, LSBFIRST, SPI_MODE3));
 
   pinMode(btnRec, INPUT_PULLUP);
   pinMode(btnPlay, INPUT_PULLUP);
@@ -385,8 +385,6 @@ void setup() {
   resetISD();
   delay(10);
   powerUp();
-  delay(50); // TPUD podla datasheet @ 8 kHz
-  clrInt();  // datasheet 11.7: Clr_Int pred kontrolou RDY po PU
   waitForReady();
 
   uint8_t devId = readDeviceId();
@@ -398,7 +396,6 @@ void setup() {
 
   if (digitalRead(btnRec) == LOW) {
     Serial.println(F("MAZANIE DYNAMICKEJ PAMATE 0x196-0x78F..."));
-    ensureDeviceReady();
     eraseDynamicRegion();
     waitForOperationEnd(20000);
     clrInt();
@@ -408,19 +405,10 @@ void setup() {
     while (digitalRead(btnRec) == LOW) delay(5);
   }
 
-  ensureDeviceReady();
   setupAPC_ANA_AUD();
-  clrInt();
-  waitForReady(2000);
+  waitForReady();
   stopISD();
   clrInt();
-  waitForReady(2000);
-  if (!poweredUp(readStatus())) {
-    powerUp();
-    delay(50);
-    clrInt();
-    waitForReady();
-  }
 
   Serial.print(F("Pamat: 0x"));
   Serial.print(MEM_START, HEX);
