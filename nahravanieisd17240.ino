@@ -1,16 +1,20 @@
 #include <SPI.h>
 
-#define ISD_SS 10
+// SPI: D13=SCK, D12=MISO, D11=MOSI, D10=SS
+#define ISD_SS  10
+// INT z ISD17240 (aktivne LOW, open-drain) -> pripojit na D6 + vnutorny pull-up
+#define ISD_INT 6
 
-const int btnRec = 2;
+const int btnRec  = 2;
 const int btnPlay = 3;
 const int btnRedo = 4;
-const int btnTrim = 5; // Tlačidlo Trim na D5
+const int btnTrim = 5;
 
-const uint32_t SPI_SPEED = 10000; // 10 kHz pre ISD17240
-const uint16_t MEM_START = 0x196;
-const uint16_t MEM_END = 0x78F;
-const uint8_t SR1_RDY = 0x01;
+const uint32_t SPI_SPEED = 10000; // max 1 MHz podla datasheet
+const uint16_t MEM_START = 0x196; // fixna obsadena cast 0x010-0x195 sa nikdy nemaže
+const uint16_t MEM_END   = 0x78F; // ISD17240 @ 8 kHz
+const uint8_t  SR1_RDY   = 0x01;
+const uint8_t  DEVID_ISD17240 = 0xE0; // CHIPID 11100 v bitoch 7:3
 
 uint16_t currentAddress = MEM_START;
 uint16_t history[100];
@@ -19,7 +23,7 @@ int recordCount = 0;
 bool isRecording = false;
 uint16_t recordingStart = MEM_START;
 
-bool lastRecState = HIGH;
+bool lastRecState  = HIGH;
 bool lastPlayState = HIGH;
 bool lastTrimState = HIGH;
 bool lastRedoState = HIGH;
@@ -55,6 +59,7 @@ void deselectISD() {
 void sendSimpleCommand(uint8_t opcode) {
   selectISD();
   xfer(opcode);
+  xfer(0x00);
   deselectISD();
 }
 
@@ -65,13 +70,26 @@ void clrInt() { sendSimpleCommand(0x04); }
 
 Status readStatus() {
   selectISD();
-  xfer(0x05);
   Status s;
-  s.sr0_lo = xfer(0x00);
+  s.sr0_lo = xfer(0x05);
   s.sr0_hi = xfer(0x00);
-  s.sr1 = xfer(0x00);
+  s.sr1    = xfer(0x00);
   deselectISD();
   return s;
+}
+
+uint16_t readCurrentRowAddress() {
+  Status s = readStatus();
+  return ((uint16_t)s.sr0_hi << 3) | ((s.sr0_lo >> 5) & 0x07);
+}
+
+uint8_t readDeviceId() {
+  selectISD();
+  xfer(0x09);
+  xfer(0x00);
+  uint8_t id = xfer(0x00);
+  deselectISD();
+  return id;
 }
 
 bool readyNow() {
@@ -85,21 +103,33 @@ bool waitForReady(unsigned long timeoutMs = 6000) {
     if (readyNow()) return true;
     delay(2);
   }
-  Serial.println(F("WARN: ISD timeout ready"));
+  Serial.println(F("WARN: ISD timeout RDY"));
   return false;
 }
 
-void globalErase() {
-  selectISD();
-  xfer(0x43);
-  xfer(0x00);
-  deselectISD();
+// INT=LOW signalizuje dokoncenu operaciu (po pripojeni INT na D6)
+bool waitForOperation(unsigned long timeoutMs = 10000) {
+  unsigned long startWait = millis();
+  while (digitalRead(ISD_INT) == HIGH && millis() - startWait < 500) {
+    delay(1);
+  }
+  if (digitalRead(ISD_INT) == LOW) {
+    while (millis() - startWait < timeoutMs) {
+      if (readyNow()) return true;
+      delay(2);
+    }
+    Serial.println(F("WARN: ISD timeout INT+RDY"));
+    return false;
+  }
+  return waitForReady(timeoutMs);
 }
 
-void setupAPC_MIC_AUD() {
+void setupAPC_ANA_AUD() {
+  // 0x440: D6=1 SPI_FT vyp (zodpoveda FT pin HIGH), AUD vystup, max hlasitost
+  // D4=0: AnaIn cesta (pri D6=1 datasheet uvadza Mic REC; overte na module s AnaIn)
   selectISD();
   xfer(0x65);
-  xfer(0x00);
+  xfer(0x40);
   xfer(0x04);
   deselectISD();
 }
@@ -127,23 +157,21 @@ void setRec(uint16_t start, uint16_t end) {
   sendSetCommand(0x81, start, end);
 }
 
-uint16_t readAddressPointer(uint8_t opcode) {
-  selectISD();
-  xfer(opcode);
-  uint8_t lo = xfer(0x00);
-  uint8_t hi = xfer(0x00) & 0x07;
-  xfer(0x00);
-  deselectISD();
-  return ((uint16_t)hi << 8) | lo;
+void setErase(uint16_t start, uint16_t end) {
+  if (start < MEM_START) start = MEM_START;
+  if (end < start) return;
+  sendSetCommand(0x82, start, end);
 }
 
-uint16_t readRecPointer() {
-  return readAddressPointer(0x08);
+// Maze len dynamicku cast (0x196-0x78F), fixna pamat 0x010-0x195 zostane
+void eraseDynamicRegion() {
+  setErase(MEM_START, MEM_END);
 }
 
 bool pressedEdge(int pin, bool &lastState) {
   bool state = digitalRead(pin);
-  bool edge = (lastState == HIGH && state == LOW && (millis() - lastButtonChange) > DEBOUNCE_MS);
+  bool edge = (lastState == HIGH && state == LOW &&
+               (millis() - lastButtonChange) > DEBOUNCE_MS);
   if (state != lastState) {
     lastState = state;
     lastButtonChange = millis();
@@ -176,21 +204,23 @@ void startRecording() {
   Serial.println(recordingStart, HEX);
 
   setRec(recordingStart, MEM_END);
+  if (!waitForOperation()) {
+    Serial.println(F("REC: chyba start"));
+    return;
+  }
   isRecording = true;
 }
 
 void finishRecording() {
   stopISD();
-  waitForReady();
+  waitForOperation();
 
-  uint16_t rawEnd = readRecPointer();
-  if (rawEnd <= recordingStart || rawEnd > MEM_END) rawEnd = recordingStart + 0x40;
-
-  uint16_t playEnd = rawEnd;
-  if (playEnd > recordingStart + 0x2A) {
-    playEnd -= 0x2A;
+  uint16_t rawEnd = readCurrentRowAddress();
+  if (rawEnd <= recordingStart || rawEnd > MEM_END) {
+    rawEnd = recordingStart + 1;
   }
-  playEnd = constrain(playEnd, recordingStart, MEM_END);
+
+  uint16_t playEnd = constrain(rawEnd, recordingStart, MEM_END);
 
   endAddresses[recordCount] = playEnd;
   currentAddress = playEnd + 1;
@@ -206,13 +236,66 @@ void finishRecording() {
   printRecordingAddress(recordCount, recordingStart, playEnd);
 }
 
+void eraseAndRedoLast() {
+  if (recordCount <= 0 || isRecording) return;
+
+  uint16_t start = history[recordCount - 1];
+  uint16_t end   = endAddresses[recordCount - 1];
+
+  Serial.print(F("REDO ERASE 0x"));
+  Serial.print(start, HEX);
+  Serial.print(F("-0x"));
+  Serial.println(end, HEX);
+
+  setErase(start, end);
+  waitForOperation(20000);
+  clrInt();
+
+  recordCount--;
+  currentAddress = start;
+
+  Serial.print(F("REDO addr=0x"));
+  Serial.println(currentAddress, HEX);
+}
+
+void trimLastRecording() {
+  if (recordCount <= 0 || isRecording) return;
+
+  uint16_t start    = history[recordCount - 1];
+  uint16_t oldEnd   = endAddresses[recordCount - 1];
+  if (oldEnd <= start) return;
+
+  uint16_t newEnd = oldEnd - 1;
+  uint16_t eraseFrom = newEnd + 1;
+
+  Serial.print(F("TRIM ERASE 0x"));
+  Serial.print(eraseFrom, HEX);
+  Serial.print(F("-0x"));
+  Serial.println(oldEnd, HEX);
+
+  setErase(eraseFrom, oldEnd);
+  waitForOperation(20000);
+  clrInt();
+
+  endAddresses[recordCount - 1] = newEnd;
+  currentAddress = newEnd + 1;
+
+  Serial.print(F("TRIM koniec=0x"));
+  Serial.println(newEnd, HEX);
+
+  setPlay(start, newEnd);
+  waitForOperation();
+  clrInt();
+}
+
 void setup() {
   Serial.begin(9600);
   pinMode(ISD_SS, OUTPUT);
   digitalWrite(ISD_SS, HIGH);
+  pinMode(ISD_INT, INPUT_PULLUP);
 
   SPI.begin();
-  SPI.beginTransaction(SPISettings(SPI_SPEED, LSBFIRST, SPI_MODE3));
+  SPI.beginTransaction(SPISettings(SPI_SPEED, LSBFIRST, SPI_MODE0));
 
   pinMode(btnRec, INPUT_PULLUP);
   pinMode(btnPlay, INPUT_PULLUP);
@@ -223,18 +306,28 @@ void setup() {
   resetISD();
   delay(10);
   powerUp();
+  delay(50); // TPUD podla datasheet @ 8 kHz
   waitForReady();
 
+  uint8_t devId = readDeviceId();
+  Serial.print(F("DEVID=0x"));
+  Serial.println(devId, HEX);
+  if ((devId & 0xF8) != DEVID_ISD17240) {
+    Serial.println(F("WARN: neocekavany chip (ocakavane ISD17240)"));
+  }
+
   if (digitalRead(btnRec) == LOW) {
-    Serial.println(F("MAZANIE CELEJ PAMATE..."));
-    globalErase();
-    waitForReady(20000);
+    Serial.println(F("MAZANIE DYNAMICKEJ PAMATE 0x196-0x78F..."));
+    eraseDynamicRegion();
+    waitForOperation(20000);
     clrInt();
+    currentAddress = MEM_START;
+    recordCount = 0;
     Serial.println(F("MAZANIE OK"));
     while (digitalRead(btnRec) == LOW) delay(5);
   }
 
-  setupAPC_MIC_AUD();
+  setupAPC_ANA_AUD();
   waitForReady();
   stopISD();
   clrInt();
@@ -243,6 +336,7 @@ void setup() {
   Serial.print(MEM_START, HEX);
   Serial.print(F("-0x"));
   Serial.println(MEM_END, HEX);
+  Serial.println(F("INT pin: pripoj ISD INT -> Arduino D6"));
   Serial.println(F("--- SYSTEM PRIPRAVENY ---"));
 }
 
@@ -256,16 +350,7 @@ void loop() {
   }
 
   if (!isRecording && pressedEdge(btnTrim, lastTrimState)) {
-    if (recordCount > 0 && endAddresses[recordCount - 1] > history[recordCount - 1] + 1) {
-      endAddresses[recordCount - 1]--;
-      currentAddress = endAddresses[recordCount - 1] + 1;
-      Serial.print(F("TRIM koniec=0x"));
-      Serial.println(endAddresses[recordCount - 1], HEX);
-
-      setPlay(history[recordCount - 1], endAddresses[recordCount - 1]);
-      waitForReady();
-      clrInt();
-    }
+    trimLastRecording();
   }
 
   if (!isRecording && pressedEdge(btnPlay, lastPlayState)) {
@@ -278,7 +363,7 @@ void loop() {
       Serial.println(e, HEX);
 
       setPlay(s, e);
-      waitForReady();
+      waitForOperation();
       clrInt();
       Serial.println(F("PLAY OK"));
     }
@@ -301,11 +386,8 @@ void loop() {
       delay(10);
     }
 
-    if (!longPressTriggered && recordCount > 0) {
-      recordCount--;
-      currentAddress = history[recordCount];
-      Serial.print(F("REDO addr=0x"));
-      Serial.println(currentAddress, HEX);
+    if (!longPressTriggered) {
+      eraseAndRedoLast();
     }
     lastButtonChange = millis();
   }
