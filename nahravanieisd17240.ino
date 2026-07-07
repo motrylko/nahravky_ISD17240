@@ -15,6 +15,7 @@ const uint16_t MEM_START = 0x196; // fixna obsadena cast 0x010-0x195 sa nikdy ne
 const uint16_t MEM_END   = 0x78F; // ISD17240 @ 8 kHz
 const uint8_t  SR1_RDY   = 0x01;
 const uint8_t  DEVID_ISD17240 = 0xE0; // CHIPID 11100 v bitoch 7:3
+const unsigned long ROW_DURATION_MS = 125; // ISD17240 @ 8 kHz: cca 240 s / 0x780 riadkov
 
 uint16_t currentAddress = MEM_START;
 uint16_t history[100];
@@ -22,6 +23,7 @@ uint16_t endAddresses[100];
 int recordCount = 0;
 bool isRecording = false;
 uint16_t recordingStart = MEM_START;
+unsigned long recordingStartMillis = 0;
 
 bool lastRecState  = HIGH;
 bool lastPlayState = HIGH;
@@ -126,13 +128,14 @@ bool waitForOperation(unsigned long timeoutMs = 10000) {
 
 void setupAPC_ANA_AUD() {
   // SET_APC = 0x000B je rovnake nastavenie ako vo fungujucom teste ISD1700.
-  // Zapina analogovu cestu na AUD/SPK aj pocas REC (odposluch nahravania)
-  // a ponecha rovnaku audio cestu pre nasledny PLAY.
-  selectISD();
-  xfer(0x65);
-  xfer(0x0B);
-  xfer(0x00);
-  deselectISD();
+  // Posielame ho priamo rovnakou sekvenciou CS/SPI ako referencny sketch,
+  // aby sa audio cesta ANA -> AUD/SPK otvorila hned po zapnuti aj pocas REC.
+  digitalWrite(ISD_SS, LOW);
+  delayMicroseconds(20);
+  SPI.transfer(0x65);
+  SPI.transfer(0x0B);
+  SPI.transfer(0x00);
+  digitalWrite(ISD_SS, HIGH);
 }
 
 void sendSetCommand(uint8_t opcode, uint16_t start, uint16_t end) {
@@ -156,15 +159,6 @@ void setPlay(uint16_t start, uint16_t end) {
 
 void setRec(uint16_t start, uint16_t end) {
   sendSetCommand(0x81, start, end);
-}
-
-uint16_t readRecordPointer() {
-  selectISD();
-  xfer(0x08);
-  uint8_t lo = xfer(0x00);
-  uint8_t hi = xfer(0x00);
-  deselectISD();
-  return ((uint16_t)(hi & 0x07) << 8) | lo;
 }
 
 void setErase(uint16_t start, uint16_t end) {
@@ -209,6 +203,7 @@ void startRecording() {
   }
 
   recordingStart = currentAddress;
+  recordingStartMillis = millis();
   history[recordCount] = recordingStart;
   Serial.print(F("REC START addr=0x"));
   Serial.println(recordingStart, HEX);
@@ -226,16 +221,12 @@ void finishRecording() {
   stopISD();
   waitForOperation();
 
-  uint16_t rawEnd = readRecordPointer();
-  if (rawEnd <= recordingStart || rawEnd > MEM_END) {
-    rawEnd = recordingStart + 1;
-  }
+  unsigned long recordedMs = millis() - recordingStartMillis;
+  uint16_t rows = (recordedMs + ROW_DURATION_MS - 1) / ROW_DURATION_MS;
+  if (rows < 1) rows = 1;
+  uint16_t rawEnd = constrain(recordingStart + rows, recordingStart + 1, MEM_END);
 
-  uint16_t playEnd = constrain(rawEnd, recordingStart, MEM_END);
-  // ISD1700 rd_rec_ptr ukazuje kus za realny koniec zvuku; bez trimu potom PLAY casto hra ticho.
-  if (playEnd > recordingStart + 0x2A) {
-    playEnd -= 0x2A;
-  }
+  uint16_t playEnd = rawEnd;
 
   endAddresses[recordCount] = playEnd;
   currentAddress = playEnd + 1;
@@ -323,6 +314,8 @@ void setup() {
   powerUp();
   delay(50); // TPUD podla datasheet @ 8 kHz
   waitForReady();
+  setupAPC_ANA_AUD();
+  waitForReady();
 
   uint8_t devId = readDeviceId();
   Serial.print(F("DEVID=0x"));
@@ -344,7 +337,6 @@ void setup() {
 
   setupAPC_ANA_AUD();
   waitForReady();
-  stopISD();
   clrInt();
 
   Serial.print(F("Pamat: 0x"));
