@@ -12,10 +12,10 @@ const int btnTrim = 5;
 
 const uint32_t SPI_SPEED = 1000000; // overene s ISD1700 kniznicou; max 1 MHz podla datasheet
 const uint16_t MEM_START = 0x196; // fixna obsadena cast 0x010-0x195 sa nikdy nemaže
-const uint16_t MEM_END   = 0x78F; // ISD17240 @ 8 kHz
+const uint16_t MEM_END   = 0x3FF; // horna adresa pouzita funkcnym ISD1700 sketchom
 const uint8_t  SR1_RDY   = 0x01;
 const uint8_t  DEVID_ISD17240 = 0xE0; // CHIPID 11100 v bitoch 7:3
-const unsigned long ROW_DURATION_MS = 125; // ISD17240 @ 8 kHz: cca 240 s / 0x780 riadkov
+const unsigned long ROW_DURATION_MS = 125; // ponechany vypocet dlzky podla casu
 
 uint16_t currentAddress = MEM_START;
 uint16_t history[100];
@@ -142,15 +142,18 @@ void sendSetCommand(uint8_t opcode, uint16_t start, uint16_t end) {
   start = constrain(start, MEM_START, MEM_END);
   end = constrain(end, start, MEM_END);
 
-  selectISD();
-  xfer(opcode);
-  xfer(0x00);
-  xfer(start & 0xFF);
-  xfer((start >> 8) & 0x07);
-  xfer(end & 0xFF);
-  xfer((end >> 8) & 0x07);
-  xfer(0x00);
-  deselectISD();
+  // Rovnaka priama 7-bajtova SET_PLAY/SET_REC/SET_ERASE sekvencia ako vo funkcnom kode.
+  // Nepouzivame tu selectISD()/xfer(), aby CS a medzibajtove casovanie zostalo co najblizsie referencii.
+  digitalWrite(ISD_SS, LOW);
+  delayMicroseconds(20);
+  SPI.transfer(opcode);
+  SPI.transfer(0x00);
+  SPI.transfer(start & 0xFF);
+  SPI.transfer((start >> 8) & 0xFF);
+  SPI.transfer(end & 0xFF);
+  SPI.transfer((end >> 8) & 0xFF);
+  SPI.transfer(0x00);
+  digitalWrite(ISD_SS, HIGH);
 }
 
 void setPlay(uint16_t start, uint16_t end) {
@@ -211,8 +214,8 @@ void startRecording() {
   setupAPC_ANA_AUD();
   waitForReady();
   setRec(recordingStart, MEM_END);
-  // Pri SET_REC nesmieme cakat na koniec operacie: cip je BUSY pocas celeho nahravania
-  // a skonci az po STOP. Kratka pauza kopiruje fungujuce nastavenie audio cesty.
+  // Pri SET_REC nesmieme cakat na koniec operacie: cip je BUSY pocas celeho nahravania.
+  // Pauza 300 ms je prevzata z funkcneho sketchu po prikaze REC.
   delay(300);
   isRecording = true;
 }
@@ -325,7 +328,7 @@ void setup() {
   }
 
   if (digitalRead(btnRec) == LOW) {
-    Serial.println(F("MAZANIE DYNAMICKEJ PAMATE 0x196-0x78F..."));
+    Serial.println(F("MAZANIE DYNAMICKEJ PAMATE 0x196-0x3FF..."));
     eraseDynamicRegion();
     waitForOperation(20000);
     clrInt();
