@@ -12,7 +12,7 @@ const int btnTrim = 5;
 
 const uint32_t SPI_SPEED = 1000000; // overene s ISD1700 kniznicou; max 1 MHz podla datasheet
 const uint16_t MEM_START = 0x196; // fixna obsadena cast 0x010-0x195 sa nikdy nemaže
-const uint16_t MEM_END   = 0x3FF; // horna adresa pouzita funkcnym ISD1700 sketchom
+const uint16_t MEM_END   = 0x78F; // koncova adresa pamate ISD17240
 const uint8_t  SR1_RDY   = 0x01;
 const uint8_t  DEVID_ISD17240 = 0xE0; // CHIPID 11100 v bitoch 7:3
 const unsigned long ROW_DURATION_MS = 125; // ponechany vypocet dlzky podla casu
@@ -328,7 +328,7 @@ void setup() {
   }
 
   if (digitalRead(btnRec) == LOW) {
-    Serial.println(F("MAZANIE DYNAMICKEJ PAMATE 0x196-0x3FF..."));
+    Serial.println(F("MAZANIE DYNAMICKEJ PAMATE 0x196-0x78F..."));
     eraseDynamicRegion();
     waitForOperation(20000);
     clrInt();
