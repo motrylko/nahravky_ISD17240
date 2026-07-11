@@ -10,11 +10,12 @@ const int btnPlay = 3;
 const int btnRedo = 4;
 const int btnTrim = 5;
 
-const uint32_t SPI_SPEED = 10000; // max 1 MHz podla datasheet
+const uint32_t SPI_SPEED = 1000000; // overene s ISD1700 kniznicou; max 1 MHz podla datasheet
 const uint16_t MEM_START = 0x196; // fixna obsadena cast 0x010-0x195 sa nikdy nemaže
-const uint16_t MEM_END   = 0x78F; // ISD17240 @ 8 kHz
+const uint16_t MEM_END   = 0x78F; // koncova adresa pamate ISD17240
 const uint8_t  SR1_RDY   = 0x01;
 const uint8_t  DEVID_ISD17240 = 0xE0; // CHIPID 11100 v bitoch 7:3
+const unsigned long ROW_DURATION_MS = 125; // ponechany vypocet dlzky podla casu
 
 uint16_t currentAddress = MEM_START;
 uint16_t history[100];
@@ -22,6 +23,7 @@ uint16_t endAddresses[100];
 int recordCount = 0;
 bool isRecording = false;
 uint16_t recordingStart = MEM_START;
+unsigned long recordingStartMillis = 0;
 
 bool lastRecState  = HIGH;
 bool lastPlayState = HIGH;
@@ -125,28 +127,33 @@ bool waitForOperation(unsigned long timeoutMs = 10000) {
 }
 
 void setupAPC_ANA_AUD() {
-  // 0x440: D6=1 SPI_FT vyp (zodpoveda FT pin HIGH), AUD vystup, max hlasitost
-  // D4=0: AnaIn cesta (pri D6=1 datasheet uvadza Mic REC; overte na module s AnaIn)
-  selectISD();
-  xfer(0x65);
-  xfer(0x40);
-  xfer(0x04);
-  deselectISD();
+  // SET_APC = 0x000B je rovnake nastavenie ako vo fungujucom teste ISD1700.
+  // Posielame ho priamo rovnakou sekvenciou CS/SPI ako referencny sketch,
+  // aby sa audio cesta ANA -> AUD/SPK otvorila hned po zapnuti aj pocas REC.
+  digitalWrite(ISD_SS, LOW);
+  delayMicroseconds(20);
+  SPI.transfer(0x65);
+  SPI.transfer(0x0B);
+  SPI.transfer(0x00);
+  digitalWrite(ISD_SS, HIGH);
 }
 
 void sendSetCommand(uint8_t opcode, uint16_t start, uint16_t end) {
   start = constrain(start, MEM_START, MEM_END);
   end = constrain(end, start, MEM_END);
 
-  selectISD();
-  xfer(opcode);
-  xfer(0x00);
-  xfer(start & 0xFF);
-  xfer((start >> 8) & 0x07);
-  xfer(end & 0xFF);
-  xfer((end >> 8) & 0x07);
-  xfer(0x00);
-  deselectISD();
+  // Rovnaka priama 7-bajtova SET_PLAY/SET_REC/SET_ERASE sekvencia ako vo funkcnom kode.
+  // Nepouzivame tu selectISD()/xfer(), aby CS a medzibajtove casovanie zostalo co najblizsie referencii.
+  digitalWrite(ISD_SS, LOW);
+  delayMicroseconds(20);
+  SPI.transfer(opcode);
+  SPI.transfer(0x00);
+  SPI.transfer(start & 0xFF);
+  SPI.transfer((start >> 8) & 0xFF);
+  SPI.transfer(end & 0xFF);
+  SPI.transfer((end >> 8) & 0xFF);
+  SPI.transfer(0x00);
+  digitalWrite(ISD_SS, HIGH);
 }
 
 void setPlay(uint16_t start, uint16_t end) {
@@ -199,15 +206,17 @@ void startRecording() {
   }
 
   recordingStart = currentAddress;
+  recordingStartMillis = millis();
   history[recordCount] = recordingStart;
   Serial.print(F("REC START addr=0x"));
   Serial.println(recordingStart, HEX);
 
+  setupAPC_ANA_AUD();
+  waitForReady();
   setRec(recordingStart, MEM_END);
-  if (!waitForOperation()) {
-    Serial.println(F("REC: chyba start"));
-    return;
-  }
+  // Pri SET_REC nesmieme cakat na koniec operacie: cip je BUSY pocas celeho nahravania.
+  // Pauza 300 ms je prevzata z funkcneho sketchu po prikaze REC.
+  delay(300);
   isRecording = true;
 }
 
@@ -215,12 +224,12 @@ void finishRecording() {
   stopISD();
   waitForOperation();
 
-  uint16_t rawEnd = readCurrentRowAddress();
-  if (rawEnd <= recordingStart || rawEnd > MEM_END) {
-    rawEnd = recordingStart + 1;
-  }
+  unsigned long recordedMs = millis() - recordingStartMillis;
+  uint16_t rows = (recordedMs + ROW_DURATION_MS - 1) / ROW_DURATION_MS;
+  if (rows < 1) rows = 1;
+  uint16_t rawEnd = constrain(recordingStart + rows, recordingStart + 1, MEM_END);
 
-  uint16_t playEnd = constrain(rawEnd, recordingStart, MEM_END);
+  uint16_t playEnd = rawEnd;
 
   endAddresses[recordCount] = playEnd;
   currentAddress = playEnd + 1;
@@ -295,7 +304,7 @@ void setup() {
   pinMode(ISD_INT, INPUT_PULLUP);
 
   SPI.begin();
-  SPI.beginTransaction(SPISettings(SPI_SPEED, LSBFIRST, SPI_MODE0));
+  SPI.beginTransaction(SPISettings(SPI_SPEED, LSBFIRST, SPI_MODE3));
 
   pinMode(btnRec, INPUT_PULLUP);
   pinMode(btnPlay, INPUT_PULLUP);
@@ -307,6 +316,8 @@ void setup() {
   delay(10);
   powerUp();
   delay(50); // TPUD podla datasheet @ 8 kHz
+  waitForReady();
+  setupAPC_ANA_AUD();
   waitForReady();
 
   uint8_t devId = readDeviceId();
@@ -329,7 +340,6 @@ void setup() {
 
   setupAPC_ANA_AUD();
   waitForReady();
-  stopISD();
   clrInt();
 
   Serial.print(F("Pamat: 0x"));
@@ -362,6 +372,8 @@ void loop() {
       Serial.print(F("-0x"));
       Serial.println(e, HEX);
 
+      setupAPC_ANA_AUD();
+      waitForReady();
       setPlay(s, e);
       waitForOperation();
       clrInt();
